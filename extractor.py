@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Rough token safety limit — gpt-4o-mini context is 128k tokens.
+# 1 token ≈ 4 chars; leave headroom for the prompt template itself.
+MAX_PDF_CHARS = 400_000
+
 
 def read_pdf_text(pdf_path: str) -> str:
     """
@@ -20,27 +24,38 @@ def read_pdf_text(pdf_path: str) -> str:
     """
     logger.info(f"Reading PDF text from: {pdf_path}")
 
-    doc = fitz.open(pdf_path)
-    pages_text = []
+    # FIX: use context manager so the file handle is always released,
+    # even if an exception is raised mid-iteration
+    with fitz.open(pdf_path) as doc:
+        pages_text = []
 
-    for i, page in enumerate(doc):
-        text = page.get_text()
-        if text.strip():
-            pages_text.append(f"--- Page {i + 1} ---\n{text.strip()}")
-
-    doc.close()
+        for i, page in enumerate(doc):
+            text = page.get_text()
+            if text.strip():
+                pages_text.append(f"--- Page {i + 1} ---\n{text.strip()}")
 
     if not pages_text:
         raise ValueError(f"No text could be extracted from: {pdf_path}")
 
     full_text = "\n\n".join(pages_text)
+
+    # FIX: guard against oversized PDFs blowing the model context window
+    if len(full_text) > MAX_PDF_CHARS:
+        logger.warning(
+            f"PDF text is {len(full_text)} chars — truncating to {MAX_PDF_CHARS} "
+            f"to stay within model context limits"
+        )
+        full_text = full_text[:MAX_PDF_CHARS]
+
     logger.info(f"Extracted {len(full_text)} characters from {len(pages_text)} pages")
     return full_text
 
 
-PURCHASE_ORDER_PROMPT = """You are a Purchase Order data extraction assistant.
+SYSTEM_PROMPT = "You are a Purchase Order data extraction assistant. Return ONLY valid JSON with no markdown, no code blocks, and no explanation."
 
-Extract information from the Purchase Order document below and return it as a STRICT JSON object.
+# FIX: move instructions into a system prompt; keep user turn as data only.
+# This is cleaner and gives the model a clearer role separation.
+PURCHASE_ORDER_PROMPT = """Extract information from the Purchase Order document below and return it as a STRICT JSON object.
 
 IMPORTANT RULES:
 - Return ONLY valid JSON. No markdown, no code blocks, no explanation.
@@ -120,9 +135,11 @@ def extract_purchase_order(pdf_text: str) -> dict:
 
     logger.info("Sending text to OpenAI for Purchase Order extraction...")
 
+    # FIX: separate system prompt from user data for cleaner role separation
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ],
         temperature=0,
@@ -131,10 +148,9 @@ def extract_purchase_order(pdf_text: str) -> dict:
     raw = response.choices[0].message.content.strip()
     logger.debug(f"Raw OpenAI response: {raw[:200]}...")
 
-    # Strip markdown code fences if present
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
+    # FIX: use a single, more robust regex that handles all fence variations
+    # (```json, ```, fences with leading/trailing whitespace, mid-string fences)
+    raw = re.sub(r"```(?:json)?\s*", "", raw).strip()
 
     try:
         extracted = json.loads(raw)
