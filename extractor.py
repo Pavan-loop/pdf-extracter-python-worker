@@ -12,8 +12,6 @@ logger = logging.getLogger(__name__)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Rough token safety limit — gpt-4o-mini context is 128k tokens.
-# 1 token ≈ 4 chars; leave headroom for the prompt template itself.
 MAX_PDF_CHARS = 400_000
 
 
@@ -24,8 +22,6 @@ def read_pdf_text(pdf_path: str) -> str:
     """
     logger.info(f"Reading PDF text from: {pdf_path}")
 
-    # FIX: use context manager so the file handle is always released,
-    # even if an exception is raised mid-iteration
     with fitz.open(pdf_path) as doc:
         pages_text = []
 
@@ -39,7 +35,6 @@ def read_pdf_text(pdf_path: str) -> str:
 
     full_text = "\n\n".join(pages_text)
 
-    # FIX: guard against oversized PDFs blowing the model context window
     if len(full_text) > MAX_PDF_CHARS:
         logger.warning(
             f"PDF text is {len(full_text)} chars — truncating to {MAX_PDF_CHARS} "
@@ -53,8 +48,6 @@ def read_pdf_text(pdf_path: str) -> str:
 
 SYSTEM_PROMPT = "You are a Purchase Order data extraction assistant. Return ONLY valid JSON with no markdown, no code blocks, and no explanation."
 
-# FIX: move instructions into a system prompt; keep user turn as data only.
-# This is cleaner and gives the model a clearer role separation.
 PURCHASE_ORDER_PROMPT = """Extract information from the Purchase Order document below and return it as a STRICT JSON object.
 
 IMPORTANT RULES:
@@ -119,25 +112,25 @@ Required JSON structure:
 
   "delivery_terms": "string or null",
   "shipping_address": "string or null",
-  "notes": "string or null"
+  "notes": "string or null",
+
+  "confidence_score": "integer between 0 and 100 — your confidence that the extracted data is accurate and complete"
 }}
 
 Document text:
 {pdf_text}"""
 
 
-def extract_purchase_order(pdf_text: str) -> dict:
-    """
-    Send extracted PDF text to OpenAI with a strict Purchase Order schema.
-    Always returns the predefined structure.
-    """
-    prompt = PURCHASE_ORDER_PROMPT.format(pdf_text=pdf_text)
+CONFIDENCE_THRESHOLD = 80
+PRIMARY_MODEL = "gpt-4o-mini"
+FALLBACK_MODEL = "gpt-5.4"
 
-    logger.info("Sending text to OpenAI for Purchase Order extraction...")
 
-    # FIX: separate system prompt from user data for cleaner role separation
+def _call_model(model: str, prompt: str) -> dict:
+    """Call a single OpenAI model and return parsed JSON."""
+    logger.info(f"Calling model={model}...")
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
@@ -146,20 +139,46 @@ def extract_purchase_order(pdf_text: str) -> dict:
     )
 
     raw = response.choices[0].message.content.strip()
-    logger.debug(f"Raw OpenAI response: {raw[:200]}...")
+    logger.debug(f"Raw response from {model}: {raw[:200]}...")
 
-    # FIX: use a single, more robust regex that handles all fence variations
-    # (```json, ```, fences with leading/trailing whitespace, mid-string fences)
     raw = re.sub(r"```(?:json)?\s*", "", raw).strip()
 
     try:
         extracted = json.loads(raw)
-        logger.info(f"Extraction successful, keys: {list(extracted.keys())}")
+        logger.info(f"Extraction successful from {model}, keys: {list(extracted.keys())}")
         return extracted
     except json.JSONDecodeError as e:
-        logger.error(f"OpenAI returned invalid JSON: {e}")
+        logger.error(f"{model} returned invalid JSON: {e}")
         logger.error(f"Raw response was: {raw[:500]}")
-        raise ValueError(f"OpenAI returned invalid JSON: {e}")
+        raise ValueError(f"{model} returned invalid JSON: {e}")
+
+
+def extract_purchase_order(pdf_text: str) -> dict:
+    """
+    Send extracted PDF text to OpenAI with a strict Purchase Order schema.
+    Uses gpt-4o-mini first; if confidence_score < 80, falls back to gpt-5.4.
+    Always returns the predefined structure.
+    """
+    prompt = PURCHASE_ORDER_PROMPT.format(pdf_text=pdf_text)
+
+    logger.info("Sending text to OpenAI for Purchase Order extraction...")
+
+    extracted = _call_model(PRIMARY_MODEL, prompt)
+    confidence = extracted.get("confidence_score")
+
+    if confidence is None:
+        logger.warning(f"{PRIMARY_MODEL} did not return a confidence_score — assuming low confidence, falling back to {FALLBACK_MODEL}")
+        extracted = _call_model(FALLBACK_MODEL, prompt)
+    elif confidence < CONFIDENCE_THRESHOLD:
+        logger.warning(
+            f"{PRIMARY_MODEL} confidence_score={confidence} is below threshold={CONFIDENCE_THRESHOLD}. "
+            f"Falling back to {FALLBACK_MODEL}..."
+        )
+        extracted = _call_model(FALLBACK_MODEL, prompt)
+    else:
+        logger.info(f"{PRIMARY_MODEL} confidence_score={confidence} — above threshold, using this result.")
+
+    return extracted
 
 
 def process_pdf(pdf_path: str) -> dict:
